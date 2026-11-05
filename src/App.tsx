@@ -2,14 +2,14 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   BookOpen, Brain, ChartNoAxesCombined, ClipboardCheck, CloudUpload,
   FileText, GraduationCap, LayoutDashboard, Library, LogOut, Menu,
-  Plus, Settings, Sparkles, Target, X, ChevronRight, CheckCircle2
+  Plus, Settings, Sparkles, Target, X, ChevronRight, CheckCircle2, Trash2
 } from 'lucide-react'
 import { supabase, supabaseConfigured } from './lib/supabase'
 import { extractDocument, normalizeExtractedText } from './lib/extract'
 import type { User } from '@supabase/supabase-js'
 
 type Page = 'inicio' | 'materiais' | 'resumos' | 'simulados' | 'desempenho'
-type Material = { id:string; title:string; original_filename:string; status:string; created_at:string; subject_id:string|null }
+type Material = { id:string; title:string; original_filename:string; status:string; created_at:string; subject_id:string|null; storage_path:string }
 type Subject = { id:string; name:string; description:string|null }
 type Summary = { id:string; title:string; content:string; material_id:string; created_at:string }
 type Quiz = { id:string; title:string; description:string|null; difficulty:number; level:number|null; question_count:number; material_id:string|null; summary_id:string|null; quiz_type?:string }
@@ -54,6 +54,7 @@ export default function App() {
   const [attempts, setAttempts] = useState<{id:string; quiz_id:string; score:number|null; correct_count:number; total_questions:number; completed_at:string|null}[]>([])
   const [loadingData, setLoadingData] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [processingMaterials, setProcessingMaterials] = useState(false)
   const [selectedSubject, setSelectedSubject] = useState('')
 
   const title = nav.find(n => n.id === page)?.label ?? 'Visão geral'
@@ -64,7 +65,7 @@ export default function App() {
     setLoadingData(true)
     const [{ data: subjectData }, { data: materialData }, { data: summaryData }, { data: quizData }, { data: attemptData }] = await Promise.all([
       supabase.from('subjects').select('id,name,description').order('created_at', { ascending: true }),
-      supabase.from('materials').select('id,title,original_filename,status,created_at,subject_id').order('created_at', { ascending: false }),
+      supabase.from('materials').select('id,title,original_filename,status,created_at,subject_id,storage_path').order('created_at', { ascending: false }),
       supabase.from('summaries').select('id,title,content,material_id,created_at').order('created_at', { ascending: false }),
       supabase.from('quizzes').select('id,title,description,difficulty,level,question_count,material_id,summary_id,quiz_type').order('created_at', { ascending: false }),
       supabase.from('quiz_attempts').select('id,quiz_id,score,correct_count,total_questions,completed_at').order('completed_at', { ascending: false }),
@@ -148,51 +149,171 @@ export default function App() {
     setSelectedSubject(data.id)
   }
 
-  async function uploadMaterial(file: File) {
+  async function uploadMaterials(files: File[]) {
     if (!supabase || !user) { setShowAuth(true); return }
-    if (file.size > 20 * 1024 * 1024) return window.alert('O limite inicial é de 20 MB por arquivo.')
-    setUploading(true)
-    const safeName = file.name.replace(/[^a-zA-Z0-9._-]+/g, '_')
-    const path = `${user.id}/${crypto.randomUUID()}-${safeName}`
-    const { error: uploadError } = await supabase.storage.from('study-materials').upload(path, file, {
-      cacheControl: '3600', upsert: false, contentType: file.type || undefined,
-    })
-    if (uploadError) { setUploading(false); return window.alert(`Falha no upload: ${uploadError.message}`) }
-    const { data, error } = await supabase.from('materials').insert({
-      user_id: user.id, subject_id: selectedSubject || null, title: file.name.replace(/\.[^.]+$/, ''),
-      original_filename: file.name, storage_path: path, mime_type: file.type || null, file_size: file.size, status: 'uploaded'
-    }).select('id,title,original_filename,status,created_at,subject_id').single()
-    if (error) {
-      await supabase.storage.from('study-materials').remove([path])
-      setUploading(false)
-      return window.alert(`O arquivo foi enviado, mas o registro não pôde ser criado: ${error.message}`)
+    if (!files.length) return
+
+    const oversized = files.filter(file => file.size > 20 * 1024 * 1024)
+    if (oversized.length) {
+      window.alert(`Os seguintes arquivos ultrapassam o limite de 20 MB e não foram enviados: ${oversized.map(f => f.name).join(', ')}`)
     }
-    setMaterials(prev => [data, ...prev])
+
+    const validFiles = files.filter(file => file.size <= 20 * 1024 * 1024)
+    if (!validFiles.length) return
+
+    setUploading(true)
+    const uploaded: Material[] = []
+
+    for (const file of validFiles) {
+      const safeName = file.name.replace(/[^a-zA-Z0-9._-]+/g, '_')
+      const path = `${user.id}/${crypto.randomUUID()}-${safeName}`
+
+      const { error: uploadError } = await supabase.storage.from('study-materials').upload(path, file, {
+        cacheControl: '3600', upsert: false, contentType: file.type || undefined,
+      })
+
+      if (uploadError) {
+        window.alert(`Falha no upload de "${file.name}": ${uploadError.message}`)
+        continue
+      }
+
+      const { data, error } = await supabase.from('materials').insert({
+        user_id: user.id,
+        subject_id: selectedSubject || null,
+        title: file.name.replace(/\.[^.]+$/, ''),
+        original_filename: file.name,
+        storage_path: path,
+        mime_type: file.type || null,
+        file_size: file.size,
+        status: 'uploaded'
+      }).select('id,title,original_filename,status,created_at,subject_id,storage_path').single()
+
+      if (error) {
+        await supabase.storage.from('study-materials').remove([path])
+        window.alert(`O arquivo "${file.name}" foi enviado, mas o registro não pôde ser criado: ${error.message}`)
+        continue
+      }
+
+      uploaded.push(data)
+    }
+
+    if (uploaded.length) {
+      setMaterials(prev => [...uploaded, ...prev])
+      window.alert(`${uploaded.length} material(is) enviado(s). Nenhum arquivo foi processado ainda. Clique em "Processar materiais" quando quiser iniciar.`)
+    }
+
     setUploading(false)
+    await loadData(user)
+    setPage('materiais')
+  }
+
+  async function processOneMaterial(material: Material) {
+    if (!supabase || !user) return false
+
     try {
-      const extracted = normalizeExtractedText((await extractDocument(file)).text)
+      setMaterials(prev => prev.map(m => m.id === material.id ? { ...m, status: 'processing' } : m))
+      await supabase.from('materials').update({ status: 'processing', error_message: null }).eq('id', material.id)
+
+      const { data: fileData, error: downloadError } = await supabase.storage.from('study-materials').download(material.storage_path)
+      if (downloadError || !fileData) throw new Error(downloadError?.message || 'Não foi possível baixar o arquivo para processamento.')
+
+      const extracted = normalizeExtractedText((await extractDocument(new File([fileData], material.original_filename, { type: fileData.type || 'application/octet-stream' }))).text)
       if (extracted.length < 50) throw new Error('Não foi possível extrair texto suficiente do arquivo. Arquivos digitalizados sem texto precisam de OCR.')
-      const { data: result, error: processError } = await supabase.functions.invoke('process-material', { body: { material_id: data.id, text: extracted } })
+
+      const { data: result, error: processError } = await supabase.functions.invoke('process-material', {
+        body: { material_id: material.id, text: extracted }
+      })
       if (processError || result?.error) throw new Error(processError?.message || result?.error)
-      await loadData(user)
-      setSelectedSummary(result.summary_id)
-      setSelectedQuiz(result.quiz_id)
-      window.alert(`Material processado: ${result.questions} questões criadas.`)
+
+      return true
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
-      await supabase.from('materials').update({ status: 'error', error_message: message }).eq('id', data.id)
-      setMaterials(prev => prev.map(m => m.id === data.id ? { ...m, status: 'error' } : m))
-      window.alert(`O arquivo foi enviado, mas o processamento falhou: ${message}`)
+      await supabase.from('materials').update({ status: 'error', error_message: message }).eq('id', material.id)
+      setMaterials(prev => prev.map(m => m.id === material.id ? { ...m, status: 'error' } : m))
+      window.alert(`O processamento de "${material.original_filename}" falhou: ${message}`)
+      return false
     }
-    setPage('materiais')
+  }
+
+  async function processUploadedMaterials() {
+    if (!supabase || !user) { setShowAuth(true); return }
+    const pending = materials.filter(m => m.status === 'uploaded')
+    if (!pending.length) {
+      window.alert('Não há materiais aguardando processamento.')
+      return
+    }
+
+    setProcessingMaterials(true)
+    let success = 0
+
+    for (const material of pending) {
+      if (await processOneMaterial(material)) success++
+    }
+
+    await loadData(user)
+    setProcessingMaterials(false)
+    window.alert(`${success} de ${pending.length} material(is) processado(s). Agora os resumos e simulados estão disponíveis.`)
+  }
+
+  async function deleteMaterial(material: Material) {
+    if (!supabase || !user) return
+    const confirmed = window.confirm(`Apagar "${material.original_filename}"? Isso também removerá o resumo, simulados e histórico ligados a este material.`)
+    if (!confirmed) return
+
+    const { error: storageError } = await supabase.storage.from('study-materials').remove([material.storage_path])
+    if (storageError) return window.alert(`Não foi possível apagar o arquivo: ${storageError.message}`)
+
+    const { error: deleteError } = await supabase.from('materials').delete().eq('id', material.id).eq('user_id', user.id)
+    if (deleteError) {
+      window.alert(`O arquivo foi removido do armazenamento, mas o registro não pôde ser apagado: ${deleteError.message}`)
+      return
+    }
+
+    setMaterials(prev => prev.filter(m => m.id !== material.id))
+    setSummaries(prev => prev.filter(s => s.material_id !== material.id))
+    setQuizzes(prev => prev.filter(q => q.material_id !== material.id))
+    setSelectedSummary('')
+    setSelectedQuiz('')
+    setQuestions([])
+    setQuizResult(null)
+  }
+
+  async function loadQuizQuestions(id: string) {
+    if (!supabase || !user) { setShowAuth(true); return false }
+
+    setSelectedQuiz(id)
+    setQuizResult(null)
+    setAnswers({})
+
+    const { data, error } = await supabase
+      .from('questions')
+      .select('id,question_number,statement,explanation,alternatives(id,letter,text)')
+      .eq('quiz_id', id)
+      .order('question_number')
+
+    if (error) {
+      window.alert(friendlyError(error))
+      return false
+    }
+
+    const loaded = (data ?? []) as unknown as Question[]
+    if (!loaded.length) {
+      window.alert('Este simulado ainda não possui questões.')
+      setQuestions([])
+      return false
+    }
+
+    setQuestions(loaded)
+    return true
   }
 
   async function openQuiz(id: string) {
     if (!supabase || !user) { setShowAuth(true); return }
     const quiz = quizzes.find(q => q.id === id)
     if (!quiz) return
+
     const level = quiz.level ?? quiz.difficulty ?? 1
-    if (level > 1) {
+    if (level > 1 && quiz.quiz_type !== 'recovery') {
       const previous = quizzes.find(q => q.material_id === quiz.material_id && (q.level ?? q.difficulty) === level - 1 && q.quiz_type !== 'recovery')
       const previousAttempt = previous ? attempts.find(a => a.quiz_id === previous.id && Number(a.score ?? 0) >= 70) : null
       if (!previousAttempt) {
@@ -201,8 +322,16 @@ export default function App() {
         return
       }
     }
+
     if (quiz.summary_id) {
-      const { data: read } = await supabase.from('summary_reads').select('id,completed_at').eq('summary_id', quiz.summary_id).eq('user_id', user.id).maybeSingle()
+      const { data: read, error: readError } = await supabase
+        .from('summary_reads')
+        .select('id,completed_at')
+        .eq('summary_id', quiz.summary_id)
+        .eq('user_id', user.id)
+        .maybeSingle()
+
+      if (readError) return window.alert(friendlyError(readError))
       if (!read?.completed_at) {
         setSelectedSummary(quiz.summary_id)
         setPage('resumos')
@@ -210,19 +339,35 @@ export default function App() {
         return
       }
     }
-    setSelectedQuiz(id); setQuizResult(null); setAnswers({})
-    const { data, error } = await supabase.from('questions').select('id,question_number,statement,explanation,alternatives(id,letter,text)').eq('quiz_id', id).order('question_number')
-    if (error) return window.alert(friendlyError(error))
-    setQuestions((data ?? []) as unknown as Question[])
+
+    await loadQuizQuestions(id)
   }
 
   async function completeSummary(summaryId: string) {
     if (!supabase || !user) return
-    const { error } = await supabase.from('summary_reads').upsert({ user_id: user.id, summary_id: summaryId, started_at: new Date().toISOString(), completed_at: new Date().toISOString() }, { onConflict: 'user_id,summary_id' })
+
+    const now = new Date().toISOString()
+    const { error } = await supabase
+      .from('summary_reads')
+      .upsert(
+        { user_id: user.id, summary_id: summaryId, started_at: now, completed_at: now },
+        { onConflict: 'user_id,summary_id' }
+      )
+
     if (error) return window.alert(friendlyError(error))
-    const summary = summaries.find(s => s.id === summaryId)
-    const q = quizzes.find(x => x.material_id === summary?.material_id)
-    if (q) { setSelectedQuiz(q.id); setPage('simulados'); await openQuiz(q.id) }
+
+    let nextQuiz = quizzes.find(q => q.summary_id === summaryId && q.quiz_type !== 'recovery')
+    if (!nextQuiz) {
+      await loadData(user)
+      nextQuiz = quizzes.find(q => q.summary_id === summaryId && q.quiz_type !== 'recovery')
+    }
+
+    if (!nextQuiz) {
+      return window.alert('A leitura foi registrada, mas ainda não encontrei o simulado deste resumo. Tente atualizar a página.')
+    }
+
+    setPage('simulados')
+    await loadQuizQuestions(nextQuiz.id)
   }
 
   async function submitQuiz() {
@@ -272,14 +417,14 @@ export default function App() {
         </section>}
 
         {page === 'materiais' && <section className="content">
-          <div className="page-title-row"><div><div className="eyebrow">BIBLIOTECA PESSOAL</div><h1>Meus materiais</h1><p className="muted">Arquivos armazenados na sua conta Supabase.</p></div><button className="primary-btn" disabled={uploading} onClick={() => document.getElementById('file-input')?.click()}><Plus size={17}/> {uploading ? 'Enviando...' : 'Enviar arquivo'}</button></div>
-          <input id="file-input" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt" hidden onChange={e => { const file=e.target.files?.[0]; if(file) uploadMaterial(file); e.currentTarget.value='' }}/>
+          <div className="page-title-row"><div><div className="eyebrow">BIBLIOTECA PESSOAL</div><h1>Meus materiais</h1><p className="muted">Selecione vários arquivos de uma vez. O processamento só começa quando você mandar iniciar.</p></div><div className="auth-actions"><button className="secondary-btn" disabled={uploading || processingMaterials} onClick={() => document.getElementById('file-input')?.click()}><Plus size={17}/> {uploading ? 'Enviando...' : 'Adicionar arquivos'}</button>{materials.some(m => m.status === 'uploaded') && <button className="primary-btn" disabled={uploading || processingMaterials} onClick={processUploadedMaterials}><Sparkles size={17}/> {processingMaterials ? 'Processando...' : 'Processar materiais'}</button>}</div></div>
+          <input id="file-input" type="file" multiple accept=".pdf,.doc,.docx,.ppt,.pptx,.txt" hidden onChange={e => { const files=Array.from(e.target.files ?? []); if(files.length) uploadMaterials(files); e.currentTarget.value='' }}/>
           {!user ? <div className="upload-zone"><div className="upload-icon"><CloudUpload size={30}/></div><h3>Entre para enviar materiais</h3><p>O armazenamento é privado e vinculado à sua conta.</p><button className="secondary-btn" onClick={() => setShowAuth(true)}>Entrar ou criar conta</button></div> : <>
             <div className="panel" style={{marginTop:25}}><div className="panel-head"><div><h3>Disciplina do novo material</h3><p className="muted">Opcional. Você pode criar uma disciplina pelo botão +.</p></div><button className="icon-btn" onClick={createSubject}><Plus size={17}/></button></div><select value={selectedSubject} onChange={e => setSelectedSubject(e.target.value)} style={{marginTop:15,width:'100%',padding:11,border:'1px solid #dfe5e2',borderRadius:8}}><option value="">Sem disciplina</option>{subjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select></div>
             <div className="upload-zone"><div className="upload-icon"><CloudUpload size={30}/></div><h3>Adicione seu próximo material</h3><p>PDF, DOCX, PPTX ou TXT. O arquivo será enviado ao bucket privado <strong>study-materials</strong>.</p><button className="secondary-btn" disabled={uploading} onClick={() => document.getElementById('file-input')?.click()}>{uploading ? 'Enviando...' : 'Selecionar arquivo'}</button><small>Limite inicial: 20 MB por arquivo.</small></div>
           </>}
-          <div className="notice"><Sparkles size={18}/><div><strong>Processamento automático</strong><p>Após o upload, o Estuda extrai o texto, salva os blocos, gera o resumo e cria o primeiro simulado. O processamento atual usa um fallback local determinístico; a camada Gemini será adicionada como provedor opcional depois.</p></div></div>
-          {loadingData ? <p className="muted" style={{marginTop:20}}>Carregando biblioteca...</p> : materials.length > 0 && <div className="panel" style={{marginTop:17}}><div className="panel-head"><div><h3>Arquivos enviados</h3><p className="muted">{materials.length} material(is).</p></div></div><div className="steps">{materials.map(m => <div className="step" key={m.id}><div className="step-icon"><FileText size={17}/></div><div className="step-copy"><strong>{m.title}</strong><small>{m.original_filename} · {m.status === 'uploaded' ? 'enviado' : m.status}</small></div><span className="level-status">{new Date(m.created_at).toLocaleDateString('pt-BR')}</span></div>)}</div></div>}
+          <div className="notice"><Sparkles size={18}/><div><strong>Processamento manual</strong><p>Os arquivos são apenas enviados primeiro. Depois de conferir a lista, clique em "Processar materiais" para extrair o conteúdo, gerar os resumos e criar os simulados.</p></div></div>
+          {loadingData ? <p className="muted" style={{marginTop:20}}>Carregando biblioteca...</p> : materials.length > 0 && <div className="panel" style={{marginTop:17}}><div className="panel-head"><div><h3>Arquivos enviados</h3><p className="muted">{materials.length} material(is). {materials.filter(m => m.status === 'uploaded').length} aguardando processamento.</p></div></div><div className="steps">{materials.map(m => <div className="step" key={m.id}><div className="step-icon"><FileText size={17}/></div><div className="step-copy"><strong>{m.title}</strong><small>{m.original_filename} · {m.status === 'uploaded' ? 'aguardando processamento' : m.status === 'processing' ? 'processando...' : m.status === 'ready' ? 'pronto' : m.status}</small></div><span className="level-status">{new Date(m.created_at).toLocaleDateString('pt-BR')}</span><button className="icon-btn" title="Apagar material" disabled={processingMaterials || uploading} onClick={() => deleteMaterial(m)}><Trash2 size={16}/></button></div>)}</div></div>}
         </section>}
 
         {page === 'resumos' && <section className="content"><div className="eyebrow">LEITURA ANTES DA AVALIAÇÃO</div><h1>Resumos de estudo</h1><p className="muted">O simulado só é liberado depois da leitura registrada.</p>{!user ? <div className="study-card"><h2>Entre para acessar seus resumos</h2><button className="primary-btn" onClick={() => setShowAuth(true)}>Entrar</button></div> : summaries.length === 0 ? <div className="study-card"><h2>Nenhum resumo ainda</h2><p className="muted">Envie um material para gerar o primeiro resumo.</p></div> : <div className="study-card"><select value={selectedSummary} onChange={e => setSelectedSummary(e.target.value)}>{summaries.map(s => <option key={s.id} value={s.id}>{s.title}</option>)}</select>{selectedSummary && <div className="summary-block"><h2>{summaries.find(s => s.id === selectedSummary)?.title}</h2><div className="summary-content">{summaries.find(s => s.id === selectedSummary)?.content.split('\n').map((line,i)=><p key={i}>{line || ' '}</p>)}</div><button className="primary-btn" onClick={() => completeSummary(selectedSummary)}>Concluir leitura e ir para o simulado <ChevronRight size={17}/></button></div>}</div>}</section>}
