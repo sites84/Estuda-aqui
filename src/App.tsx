@@ -12,7 +12,7 @@ type Page = 'inicio' | 'materiais' | 'resumos' | 'simulados' | 'desempenho'
 type Material = { id:string; title:string; original_filename:string; status:string; created_at:string; subject_id:string|null; storage_path:string }
 type Subject = { id:string; name:string; description:string|null }
 type Summary = { id:string; title:string; content:string; material_id:string; created_at:string }
-type Quiz = { id:string; title:string; description:string|null; difficulty:number; level:number|null; question_count:number; material_id:string|null; summary_id:string|null; quiz_type?:string }
+type Quiz = { id:string; title:string; description:string|null; difficulty:number; level:number|null; question_count:number; material_id:string|null; summary_id:string|null; study_batch_id:string|null; quiz_type?:string }
 type Question = { id:string; question_number:number; statement:string; explanation:string|null; alternatives:{id:string; letter:string; text:string}[] }
 
 const nav: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
@@ -71,7 +71,7 @@ export default function App() {
       supabase.from('subjects').select('id,name,description').order('created_at', { ascending: true }),
       supabase.from('materials').select('id,title,original_filename,status,created_at,subject_id,storage_path').order('created_at', { ascending: false }),
       supabase.from('summaries').select('id,title,content,material_id,created_at').order('created_at', { ascending: false }),
-      supabase.from('quizzes').select('id,title,description,difficulty,level,question_count,material_id,summary_id,quiz_type').order('created_at', { ascending: false }),
+      supabase.from('quizzes').select('id,title,description,difficulty,level,question_count,material_id,summary_id,study_batch_id,quiz_type').order('created_at', { ascending: false }),
       supabase.from('quiz_attempts').select('id,quiz_id,score,correct_count,total_questions,completed_at').order('completed_at', { ascending: false }),
     ])
     setSubjects(subjectData ?? [])
@@ -300,56 +300,6 @@ export default function App() {
     setPage('materiais')
   }
 
-  async function processOneMaterial(material: Material, basePercent: number, spanPercent: number) {
-    if (!supabase || !user) return false
-
-    let progressTimer: number | undefined
-
-    try {
-      setProcessingCurrent(material.original_filename)
-      setMaterials(prev => prev.map(m => m.id === material.id ? { ...m, status: 'processing' } : m))
-      await supabase.from('materials').update({ status: 'processing', error_message: null }).eq('id', material.id)
-
-      setProcessingProgress(Math.round(basePercent + spanPercent * 0.08))
-
-      const { data: fileData, error: downloadError } = await supabase.storage.from('study-materials').download(material.storage_path)
-      if (downloadError || !fileData) throw new Error(downloadError?.message || 'Não foi possível baixar o arquivo para processamento.')
-
-      setProcessingProgress(Math.round(basePercent + spanPercent * 0.20))
-
-      const extracted = normalizeExtractedText((await extractDocument(new File([fileData], material.original_filename, { type: fileData.type || 'application/octet-stream' }))).text)
-      if (extracted.length < 50) throw new Error('Não foi possível extrair texto suficiente do arquivo. Arquivos digitalizados sem texto precisam de OCR.')
-
-      setProcessingProgress(Math.round(basePercent + spanPercent * 0.30))
-
-      // A função cria resumo + 5 níveis em lote. O avanço entre 30% e 90% é uma indicação visual
-      // enquanto aguardamos a resposta do servidor, pois o Edge Function não envia eventos de progresso.
-      progressTimer = window.setInterval(() => {
-        setProcessingProgress(current => Math.min(Math.round(basePercent + spanPercent * 0.90), current + 1))
-      }, 350)
-
-      const { data: result, error: processError } = await supabase.functions.invoke('process-material', {
-        body: { material_id: material.id, text: extracted }
-      })
-
-      if (processError || result?.error) {
-        const detail = result?.error || processError?.message || 'Falha ao comunicar com o processamento.'
-        throw new Error(detail)
-      }
-
-      setProcessingProgress(Math.round(basePercent + spanPercent))
-      return true
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e)
-      await supabase.from('materials').update({ status: 'error', error_message: message }).eq('id', material.id)
-      setMaterials(prev => prev.map(m => m.id === material.id ? { ...m, status: 'error' } : m))
-      window.alert(`O processamento de "${material.original_filename}" falhou: ${message}`)
-      return false
-    } finally {
-      if (progressTimer) window.clearInterval(progressTimer)
-    }
-  }
-
   async function processUploadedMaterials() {
     if (!supabase || !user) { setShowAuth(true); return }
 
@@ -361,21 +311,71 @@ export default function App() {
 
     setProcessingMaterials(true)
     setProcessingProgress(0)
+    setProcessingCurrent('Preparando os materiais…')
 
-    let success = 0
+    try {
+      const items: { material_id: string; text: string }[] = []
 
-    for (let index = 0; index < pending.length; index++) {
-      const base = (index / pending.length) * 100
-      const span = 100 / pending.length
-      if (await processOneMaterial(pending[index], base, span)) success++
+      for (let index = 0; index < pending.length; index++) {
+        const material = pending[index]
+        setProcessingCurrent(`Extraindo ${material.original_filename}`)
+        setProcessingProgress(Math.round((index / pending.length) * 55))
+
+        const { data: fileData, error: downloadError } = await supabase.storage
+          .from('study-materials')
+          .download(material.storage_path)
+
+        if (downloadError || !fileData) {
+          throw new Error(`Não foi possível baixar "${material.original_filename}": ${downloadError?.message || 'arquivo indisponível'}`)
+        }
+
+        const extracted = normalizeExtractedText(
+          (await extractDocument(
+            new File([fileData], material.original_filename, { type: fileData.type || 'application/octet-stream' })
+          )).text
+        )
+
+        if (extracted.length < 50) {
+          throw new Error(`Não foi possível extrair texto suficiente de "${material.original_filename}". Arquivos digitalizados sem texto precisam de OCR.`)
+        }
+
+        items.push({ material_id: material.id, text: extracted })
+        setProcessingProgress(Math.round(((index + 1) / pending.length) * 55))
+      }
+
+      setProcessingCurrent(`Gerando 5 níveis para o conjunto de ${pending.length} material(is)…`)
+      setProcessingProgress(60)
+
+      let fakeProgress = 60
+      const timer = window.setInterval(() => {
+        fakeProgress = Math.min(94, fakeProgress + 1)
+        setProcessingProgress(fakeProgress)
+      }, 500)
+
+      const { data: result, error: processError } = await supabase.functions.invoke('process-material', {
+        body: { items }
+      })
+
+      window.clearInterval(timer)
+
+      if (processError || result?.error) {
+        throw new Error(result?.error || processError?.message || 'Falha ao processar os materiais.')
+      }
+
+      setProcessingProgress(100)
+      setProcessingCurrent('Concluído')
+      await loadData(user)
+      setPage('resumos')
+
+      window.alert(`Concluído. Os ${pending.length} materiais foram combinados em um único conjunto de estudo com 5 níveis e 100 questões.`)
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      window.alert(`O processamento falhou: ${message}`)
+      await loadData(user)
+    } finally {
+      setProcessingMaterials(false)
+      setProcessingCurrent('')
     }
-
-    setProcessingProgress(100)
-    setProcessingCurrent('')
-    await loadData(user)
-    setProcessingMaterials(false)
-
-    window.alert(`${success} de ${pending.length} material(is) processado(s). Agora os resumos e simulados estão disponíveis.`)
   }
 
   async function deleteMaterial(material: Material) {
@@ -443,7 +443,7 @@ export default function App() {
 
     const level = quiz.level ?? quiz.difficulty ?? 1
     if (level > 1 && quiz.quiz_type !== 'recovery') {
-      const previous = quizzes.find(q => q.material_id === quiz.material_id && (q.level ?? q.difficulty) === level - 1 && q.quiz_type !== 'recovery')
+      const previous = quizzes.find(q => q.study_batch_id === quiz.study_batch_id && (q.level ?? q.difficulty) === level - 1 && q.quiz_type !== 'recovery')
       const previousAttempt = previous ? attempts.find(a => a.quiz_id === previous.id && Number(a.score ?? 0) >= 70) : null
       if (!previousAttempt) {
         const previousTitle = previous ? `Nível ${level - 1}` : 'o nível anterior'
@@ -485,10 +485,10 @@ export default function App() {
 
     if (error) return window.alert(friendlyError(error))
 
-    let nextQuiz = quizzes.find(q => q.summary_id === summaryId && q.quiz_type !== 'recovery')
+    let nextQuiz = quizzes.find(q => q.summary_id === summaryId && q.quiz_type !== 'recovery' && q.study_batch_id)
     if (!nextQuiz) {
       await loadData(user)
-      nextQuiz = quizzes.find(q => q.summary_id === summaryId && q.quiz_type !== 'recovery')
+      nextQuiz = quizzes.find(q => q.summary_id === summaryId && q.quiz_type !== 'recovery' && q.study_batch_id)
     }
 
     if (!nextQuiz) {
@@ -554,12 +554,12 @@ export default function App() {
             <div className="panel" style={{marginTop:25}}><div className="panel-head"><div><h3>Disciplina do novo material</h3><p className="muted">Opcional. Você pode criar uma disciplina pelo botão +.</p></div><button className="icon-btn" onClick={createSubject}><Plus size={17}/></button></div><select value={selectedSubject} onChange={e => setSelectedSubject(e.target.value)} style={{marginTop:15,width:'100%',padding:11,border:'1px solid #dfe5e2',borderRadius:8}}><option value="">Sem disciplina</option>{subjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select></div>
             <div className="upload-zone"><div className="upload-icon"><CloudUpload size={30}/></div><h3>Adicione seus materiais</h3><p>Selecione um ou vários arquivos. Eles serão enviados ao bucket privado <strong>study-materials</strong>.</p><button className="secondary-btn" disabled={uploading || processingMaterials} onClick={() => document.getElementById('file-input')?.click()}>{uploading ? 'Enviando...' : 'Selecionar arquivos'}</button><small>Limite inicial: 20 MB por arquivo.</small></div>
           </>}
-          <div className="notice"><Sparkles size={18}/><div><strong>Processamento manual</strong><p>Os arquivos são apenas enviados primeiro. Depois de conferir a lista, clique em "Processar materiais" para extrair o conteúdo, gerar os resumos e criar os simulados.</p></div></div>
+          <div className="notice"><Sparkles size={18}/><div><strong>Processamento em conjunto</strong><p>Os arquivos são enviados primeiro. Depois de conferir a lista, clique em "Processar materiais". Todos os arquivos aguardando processamento serão combinados em um único conjunto, com um resumo integrado e apenas 5 níveis.</p></div></div>
           {loadingData ? <p className="muted" style={{marginTop:20}}>Carregando biblioteca...</p> : materials.length > 0 && <div className="panel" style={{marginTop:17}}><div className="panel-head"><div><h3>Arquivos enviados</h3><p className="muted">{materials.length} material(is). {materials.filter(m => m.status === 'uploaded' || m.status === 'error' || m.status === 'failed').length} aguardando processamento ou nova tentativa.</p></div></div><div className="steps">{materials.map(m => <div className="step" key={m.id}><div className="step-icon"><FileText size={17}/></div><div className="step-copy"><strong>{m.title}</strong><small>{m.original_filename} · {m.status === 'uploaded' ? 'aguardando processamento' : m.status === 'processing' ? 'processando...' : m.status === 'ready' ? 'pronto' : m.status === 'error' || m.status === 'failed' ? 'falhou — pode tentar novamente' : m.status}</small></div><span className="level-status">{new Date(m.created_at).toLocaleDateString('pt-BR')}</span><button className="icon-btn" title="Apagar material" disabled={processingMaterials || uploading} onClick={() => deleteMaterial(m)}><Trash2 size={16}/></button></div>)}</div></div>}
         </section>}
 
         {page === 'resumos' && <section className="content"><div className="eyebrow">LEITURA ANTES DA AVALIAÇÃO</div><h1>Resumos de estudo</h1><p className="muted">O simulado só é liberado depois da leitura registrada.</p>{!user ? <div className="study-card"><h2>Entre para acessar seus resumos</h2><button className="primary-btn" onClick={() => setShowAuth(true)}>Entrar</button></div> : summaries.length === 0 ? <div className="study-card"><h2>Nenhum resumo ainda</h2><p className="muted">Envie um material para gerar o primeiro resumo.</p></div> : <div className="study-card"><select value={selectedSummary} onChange={e => setSelectedSummary(e.target.value)}>{summaries.map(s => <option key={s.id} value={s.id}>{s.title}</option>)}</select>{selectedSummary && <div className="summary-block"><h2>{summaries.find(s => s.id === selectedSummary)?.title}</h2><div className="summary-content">{summaries.find(s => s.id === selectedSummary)?.content.split('\n').map((line,i)=><p key={i}>{line || ' '}</p>)}</div><button className="primary-btn" onClick={() => completeSummary(selectedSummary)}>Concluir leitura e ir para o simulado <ChevronRight size={17}/></button></div>}</div>}</section>}
-        {page === 'simulados' && <section className="content"><div className="eyebrow">AVALIAÇÃO PROGRESSIVA</div><h1>Simulado adaptativo</h1><p className="muted">5 níveis, 20 questões por nível. O próximo nível exige pelo menos 70% no anterior.</p>{!user ? <div className="study-card"><h2>Entre para responder</h2><button className="primary-btn" onClick={() => setShowAuth(true)}>Entrar</button></div> : quizzes.length === 0 ? <div className="study-card"><h2>Nenhum simulado ainda</h2><p className="muted">Envie e processe um material primeiro.</p></div> : <><div className="panel"><div className="panel-head"><div><h3>Escolha o nível</h3><p className="muted">Níveis bloqueados exigem aprovação no anterior.</p></div></div><select value={selectedQuiz} onChange={e => openQuiz(e.target.value)} style={{width:'100%',padding:11,border:'1px solid #dfe5e2',borderRadius:8}}>{quizzes.filter(q => q.quiz_type !== 'recovery').map(q => <option key={q.id} value={q.id}>Nível {q.level ?? q.difficulty} — {q.question_count} questões</option>)}</select></div>{questions.length === 0 ? <div className="study-card"><p className="muted">Selecione um nível e comece.</p><button className="primary-btn" onClick={() => openQuiz(selectedQuiz)}>Começar nível</button></div> : <div className="quiz-list">{questions.map(q => { const detail = quizResult?.details?.find((d:any) => d.question_id === q.id); return <div className={`panel quiz-question ${detail ? (detail.correct ? 'answered-correct' : 'answered-wrong') : ''}`} key={q.id}><div className="eyebrow">QUESTÃO {q.question_number}</div><h3>{q.statement}</h3>{q.alternatives.map(a => <label className={`alternative ${detail?.correct_alternative_id === a.id ? 'correct-option' : detail && answers[q.id] === a.id && !detail.correct ? 'wrong-option' : ''}`} key={a.id}><input type="radio" name={q.id} checked={answers[q.id]===a.id} disabled={!!quizResult} onChange={()=>setAnswers({...answers,[q.id]:a.id})}/><strong>{a.letter}.</strong> {a.text}</label>)}{detail && <p className="quiz-feedback">{detail.correct ? 'Resposta correta.' : 'Resposta incorreta. A alternativa correta está destacada.'} {q.explanation || ''}</p>}</div>})}{!quizResult ? <button className="primary-btn" onClick={submitQuiz}>Finalizar nível</button> : <><div className="notice"><CheckCircle2 size={20}/><div><strong>Resultado do nível: {quizResult.score}%</strong><p>{quizResult.correct} de {quizResult.total} respostas corretas. {quizResult.can_advance ? 'Próximo nível liberado.' : (quizResult.level < 5 ? 'É necessário alcançar 70% para avançar.' : 'Você concluiu os 5 níveis.')}</p></div></div><div className="auth-actions"><button className="secondary-btn" onClick={createRecoveryQuiz}>Treinar meus erros</button><button className="secondary-btn" onClick={() => { setQuizResult(null); setAnswers({}); window.scrollTo({top:0,behavior:'smooth'}) }}>Tentar novamente</button>{quizResult.can_advance && quizResult.next_quiz_id && <button className="primary-btn" onClick={() => openQuiz(quizResult.next_quiz_id)}>Avançar para o nível {Number(quizResult.level)+1}</button>}</div></>}</div>}</>}</section>}
+        {page === 'simulados' && <section className="content"><div className="eyebrow">AVALIAÇÃO PROGRESSIVA</div><h1>Simulado adaptativo</h1><p className="muted">Cada conjunto de materiais gera 5 níveis, com 20 questões novas por nível. Materiais enviados juntos formam um único conjunto de estudo.</p>{!user ? <div className="study-card"><h2>Entre para responder</h2><button className="primary-btn" onClick={() => setShowAuth(true)}>Entrar</button></div> : quizzes.length === 0 ? <div className="study-card"><h2>Nenhum simulado ainda</h2><p className="muted">Envie e processe um material primeiro.</p></div> : <><div className="panel"><div className="panel-head"><div><h3>Escolha o nível</h3><p className="muted">Níveis bloqueados exigem aprovação no anterior.</p></div></div><select value={selectedQuiz} onChange={e => openQuiz(e.target.value)} style={{width:'100%',padding:11,border:'1px solid #dfe5e2',borderRadius:8}}>{Object.values(quizzes.filter(q => q.quiz_type !== 'recovery' && q.study_batch_id).reduce((groups: Record<string, Quiz[]>, q) => { const key=q.study_batch_id as string; (groups[key] ||= []).push(q); return groups }, {})).map(group => <optgroup key={group[0].study_batch_id} label={group[0].title.replace(/^Nível \d+ — /,'')}>{group.sort((a,b)=>(a.level??a.difficulty)-(b.level??b.difficulty)).map(q => <option key={q.id} value={q.id}>Nível {q.level ?? q.difficulty} — {q.question_count} questões</option>)}</optgroup>)}</select></div>{questions.length === 0 ? <div className="study-card"><p className="muted">Selecione um nível e comece.</p><button className="primary-btn" onClick={() => openQuiz(selectedQuiz)}>Começar nível</button></div> : <div className="quiz-list">{questions.map(q => { const detail = quizResult?.details?.find((d:any) => d.question_id === q.id); return <div className={`panel quiz-question ${detail ? (detail.correct ? 'answered-correct' : 'answered-wrong') : ''}`} key={q.id}><div className="eyebrow">QUESTÃO {q.question_number}</div><h3>{q.statement}</h3>{q.alternatives.map(a => <label className={`alternative ${detail?.correct_alternative_id === a.id ? 'correct-option' : detail && answers[q.id] === a.id && !detail.correct ? 'wrong-option' : ''}`} key={a.id}><input type="radio" name={q.id} checked={answers[q.id]===a.id} disabled={!!quizResult} onChange={()=>setAnswers({...answers,[q.id]:a.id})}/><strong>{a.letter}.</strong> {a.text}</label>)}{detail && <p className="quiz-feedback">{detail.correct ? 'Resposta correta.' : 'Resposta incorreta. A alternativa correta está destacada.'} {q.explanation || ''}</p>}</div>})}{!quizResult ? <button className="primary-btn" onClick={submitQuiz}>Finalizar nível</button> : <><div className="notice"><CheckCircle2 size={20}/><div><strong>Resultado do nível: {quizResult.score}%</strong><p>{quizResult.correct} de {quizResult.total} respostas corretas. {quizResult.can_advance ? 'Próximo nível liberado.' : (quizResult.level < 5 ? 'É necessário alcançar 70% para avançar.' : 'Você concluiu os 5 níveis.')}</p></div></div><div className="auth-actions"><button className="secondary-btn" onClick={createRecoveryQuiz}>Treinar meus erros</button><button className="secondary-btn" onClick={() => { setQuizResult(null); setAnswers({}); window.scrollTo({top:0,behavior:'smooth'}) }}>Tentar novamente</button>{quizResult.can_advance && quizResult.next_quiz_id && <button className="primary-btn" onClick={() => openQuiz(quizResult.next_quiz_id)}>Avançar para o nível {Number(quizResult.level)+1}</button>}</div></>}</div>}</>}</section>}
         {page === 'desempenho' && <section className="content"><div className="eyebrow">ACOMPANHAMENTO</div><h1>Desempenho</h1><p className="muted">Resultados registrados nos seus simulados.</p>{attempts.length === 0 ? <div className="panel performance-empty"><ChartNoAxesCombined size={34}/><h3>Ainda não há dados</h3><p>Conclua um simulado para começar a construir seu histórico.</p></div> : <><div className="stats-grid"><Stat icon={<ClipboardCheck/>} label="Simulados" value={String(attempts.length)} note="Tentativas concluídas"/><Stat icon={<Target/>} label="Aproveitamento" value={`${Math.round(attempts.reduce((a,x)=>a+(Number(x.score)||0),0)/attempts.length)}%`} note="Média das tentativas"/><Stat icon={<Brain/>} label="Questões" value={String(attempts.reduce((a,x)=>a+(x.total_questions||0),0))} note="Questões avaliadas"/><Stat icon={<CheckCircle2/>} label="Acertos" value={String(attempts.reduce((a,x)=>a+(x.correct_count||0),0))} note="Respostas corretas"/></div><div className="panel" style={{marginTop:18}}><div className="panel-head"><div><h3>Histórico</h3><p className="muted">Mais recente primeiro.</p></div></div><div className="steps">{attempts.map(a => <div className="step" key={a.id}><div className="step-icon"><ClipboardCheck size={17}/></div><div className="step-copy"><strong>{quizzes.find(q=>q.id===a.quiz_id)?.title || 'Simulado'}</strong><small>{a.correct_count}/{a.total_questions} acertos · {a.completed_at ? new Date(a.completed_at).toLocaleString('pt-BR') : ''}</small></div><span className="level-status">{Number(a.score || 0).toFixed(0)}%</span></div>)}</div></div></>}</section>}
       </main>
 
