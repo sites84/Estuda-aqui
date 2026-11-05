@@ -263,6 +263,12 @@ export default function App() {
     const { error: storageError } = await supabase.storage.from('study-materials').remove([material.storage_path])
     if (storageError) return window.alert(`Não foi possível apagar o arquivo: ${storageError.message}`)
 
+    const { error: quizDeleteError } = await supabase.from('quizzes').delete().eq('material_id', material.id).eq('user_id', user.id)
+    if (quizDeleteError) {
+      window.alert(`O arquivo foi removido do armazenamento, mas os simulados ligados a ele não puderam ser apagados: ${quizDeleteError.message}`)
+      return
+    }
+
     const { error: deleteError } = await supabase.from('materials').delete().eq('id', material.id).eq('user_id', user.id)
     if (deleteError) {
       window.alert(`O arquivo foi removido do armazenamento, mas o registro não pôde ser apagado: ${deleteError.message}`)
