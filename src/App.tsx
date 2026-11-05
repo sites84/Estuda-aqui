@@ -54,7 +54,11 @@ export default function App() {
   const [attempts, setAttempts] = useState<{id:string; quiz_id:string; score:number|null; correct_count:number; total_questions:number; completed_at:string|null}[]>([])
   const [loadingData, setLoadingData] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [uploadFileName, setUploadFileName] = useState('')
   const [processingMaterials, setProcessingMaterials] = useState(false)
+  const [processingProgress, setProcessingProgress] = useState(0)
+  const [processingCurrent, setProcessingCurrent] = useState('')
   const [selectedSubject, setSelectedSubject] = useState('')
 
   const title = nav.find(n => n.id === page)?.label ?? 'Visão geral'
@@ -149,6 +153,49 @@ export default function App() {
     setSelectedSubject(data.id)
   }
 
+  async function uploadFileWithProgress(file: File, path: string, onProgress: (percent: number) => void) {
+    if (!supabase) throw new Error('Supabase não está configurado.')
+
+    const sessionResult = await supabase.auth.getSession()
+    const accessToken = sessionResult.data.session?.access_token
+    if (!accessToken) throw new Error('Sua sessão expirou. Entre novamente.')
+
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string
+    const publishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string
+    const endpoint = `${supabaseUrl}/storage/v1/object/study-materials/${path}`
+
+    await new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', endpoint)
+      xhr.setRequestHeader('Authorization', `Bearer ${accessToken}`)
+      xhr.setRequestHeader('apikey', publishableKey)
+      xhr.setRequestHeader('x-upsert', 'false')
+      xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream')
+
+      xhr.upload.onprogress = event => {
+        if (event.lengthComputable) onProgress(Math.min(100, Math.round((event.loaded / event.total) * 100)))
+      }
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          onProgress(100)
+          resolve()
+        } else {
+          let message = `Falha no upload (HTTP ${xhr.status}).`
+          try {
+            const body = JSON.parse(xhr.responseText)
+            if (body?.message) message = body.message
+          } catch {}
+          reject(new Error(message))
+        }
+      }
+
+      xhr.onerror = () => reject(new Error('Falha de conexão durante o upload.'))
+      xhr.onabort = () => reject(new Error('Upload cancelado.'))
+      xhr.send(file)
+    })
+  }
+
   async function uploadMaterials(files: File[]) {
     if (!supabase || !user) { setShowAuth(true); return }
     if (!files.length) return
@@ -162,69 +209,98 @@ export default function App() {
     if (!validFiles.length) return
 
     setUploading(true)
+    setUploadProgress(0)
+
     const uploaded: Material[] = []
 
-    for (const file of validFiles) {
+    for (let index = 0; index < validFiles.length; index++) {
+      const file = validFiles[index]
+      setUploadFileName(file.name)
+      setUploadProgress(0)
+
       const safeName = file.name.replace(/[^a-zA-Z0-9._-]+/g, '_')
       const path = `${user.id}/${crypto.randomUUID()}-${safeName}`
 
-      const { error: uploadError } = await supabase.storage.from('study-materials').upload(path, file, {
-        cacheControl: '3600', upsert: false, contentType: file.type || undefined,
-      })
+      try {
+        await uploadFileWithProgress(file, path, percent => {
+          const overall = Math.round(((index + percent / 100) / validFiles.length) * 100)
+          setUploadProgress(overall)
+        })
 
-      if (uploadError) {
-        window.alert(`Falha no upload de "${file.name}": ${uploadError.message}`)
-        continue
+        const { data, error } = await supabase.from('materials').insert({
+          user_id: user.id,
+          subject_id: selectedSubject || null,
+          title: file.name.replace(/\.[^.]+$/, ''),
+          original_filename: file.name,
+          storage_path: path,
+          mime_type: file.type || null,
+          file_size: file.size,
+          status: 'uploaded'
+        }).select('id,title,original_filename,status,created_at,subject_id,storage_path').single()
+
+        if (error) {
+          await supabase.storage.from('study-materials').remove([path])
+          throw new Error(error.message)
+        }
+
+        uploaded.push(data)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        window.alert(`Falha no upload de "${file.name}": ${message}`)
       }
-
-      const { data, error } = await supabase.from('materials').insert({
-        user_id: user.id,
-        subject_id: selectedSubject || null,
-        title: file.name.replace(/\.[^.]+$/, ''),
-        original_filename: file.name,
-        storage_path: path,
-        mime_type: file.type || null,
-        file_size: file.size,
-        status: 'uploaded'
-      }).select('id,title,original_filename,status,created_at,subject_id,storage_path').single()
-
-      if (error) {
-        await supabase.storage.from('study-materials').remove([path])
-        window.alert(`O arquivo "${file.name}" foi enviado, mas o registro não pôde ser criado: ${error.message}`)
-        continue
-      }
-
-      uploaded.push(data)
     }
+
+    setUploadProgress(100)
+    setUploadFileName('')
+    setUploading(false)
 
     if (uploaded.length) {
       setMaterials(prev => [...uploaded, ...prev])
       window.alert(`${uploaded.length} material(is) enviado(s). Nenhum arquivo foi processado ainda. Clique em "Processar materiais" quando quiser iniciar.`)
     }
 
-    setUploading(false)
     await loadData(user)
     setPage('materiais')
   }
 
-  async function processOneMaterial(material: Material) {
+  async function processOneMaterial(material: Material, basePercent: number, spanPercent: number) {
     if (!supabase || !user) return false
 
+    let progressTimer: number | undefined
+
     try {
+      setProcessingCurrent(material.original_filename)
       setMaterials(prev => prev.map(m => m.id === material.id ? { ...m, status: 'processing' } : m))
       await supabase.from('materials').update({ status: 'processing', error_message: null }).eq('id', material.id)
+
+      setProcessingProgress(Math.round(basePercent + spanPercent * 0.08))
 
       const { data: fileData, error: downloadError } = await supabase.storage.from('study-materials').download(material.storage_path)
       if (downloadError || !fileData) throw new Error(downloadError?.message || 'Não foi possível baixar o arquivo para processamento.')
 
+      setProcessingProgress(Math.round(basePercent + spanPercent * 0.20))
+
       const extracted = normalizeExtractedText((await extractDocument(new File([fileData], material.original_filename, { type: fileData.type || 'application/octet-stream' }))).text)
       if (extracted.length < 50) throw new Error('Não foi possível extrair texto suficiente do arquivo. Arquivos digitalizados sem texto precisam de OCR.')
+
+      setProcessingProgress(Math.round(basePercent + spanPercent * 0.30))
+
+      // A função cria resumo + 5 níveis em lote. O avanço entre 30% e 90% é uma indicação visual
+      // enquanto aguardamos a resposta do servidor, pois o Edge Function não envia eventos de progresso.
+      progressTimer = window.setInterval(() => {
+        setProcessingProgress(current => Math.min(Math.round(basePercent + spanPercent * 0.90), current + 1))
+      }, 350)
 
       const { data: result, error: processError } = await supabase.functions.invoke('process-material', {
         body: { material_id: material.id, text: extracted }
       })
-      if (processError || result?.error) throw new Error(processError?.message || result?.error)
 
+      if (processError || result?.error) {
+        const detail = result?.error || processError?.message || 'Falha ao comunicar com o processamento.'
+        throw new Error(detail)
+      }
+
+      setProcessingProgress(Math.round(basePercent + spanPercent))
       return true
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
@@ -232,11 +308,14 @@ export default function App() {
       setMaterials(prev => prev.map(m => m.id === material.id ? { ...m, status: 'error' } : m))
       window.alert(`O processamento de "${material.original_filename}" falhou: ${message}`)
       return false
+    } finally {
+      if (progressTimer) window.clearInterval(progressTimer)
     }
   }
 
   async function processUploadedMaterials() {
     if (!supabase || !user) { setShowAuth(true); return }
+
     const pending = materials.filter(m => m.status === 'uploaded')
     if (!pending.length) {
       window.alert('Não há materiais aguardando processamento.')
@@ -244,44 +323,22 @@ export default function App() {
     }
 
     setProcessingMaterials(true)
+    setProcessingProgress(0)
+
     let success = 0
 
-    for (const material of pending) {
-      if (await processOneMaterial(material)) success++
+    for (let index = 0; index < pending.length; index++) {
+      const base = (index / pending.length) * 100
+      const span = 100 / pending.length
+      if (await processOneMaterial(pending[index], base, span)) success++
     }
 
+    setProcessingProgress(100)
+    setProcessingCurrent('')
     await loadData(user)
     setProcessingMaterials(false)
+
     window.alert(`${success} de ${pending.length} material(is) processado(s). Agora os resumos e simulados estão disponíveis.`)
-  }
-
-  async function deleteMaterial(material: Material) {
-    if (!supabase || !user) return
-    const confirmed = window.confirm(`Apagar "${material.original_filename}"? Isso também removerá o resumo, simulados e histórico ligados a este material.`)
-    if (!confirmed) return
-
-    const { error: storageError } = await supabase.storage.from('study-materials').remove([material.storage_path])
-    if (storageError) return window.alert(`Não foi possível apagar o arquivo: ${storageError.message}`)
-
-    const { error: quizDeleteError } = await supabase.from('quizzes').delete().eq('material_id', material.id).eq('user_id', user.id)
-    if (quizDeleteError) {
-      window.alert(`O arquivo foi removido do armazenamento, mas os simulados ligados a ele não puderam ser apagados: ${quizDeleteError.message}`)
-      return
-    }
-
-    const { error: deleteError } = await supabase.from('materials').delete().eq('id', material.id).eq('user_id', user.id)
-    if (deleteError) {
-      window.alert(`O arquivo foi removido do armazenamento, mas o registro não pôde ser apagado: ${deleteError.message}`)
-      return
-    }
-
-    setMaterials(prev => prev.filter(m => m.id !== material.id))
-    setSummaries(prev => prev.filter(s => s.material_id !== material.id))
-    setQuizzes(prev => prev.filter(q => q.material_id !== material.id))
-    setSelectedSummary('')
-    setSelectedQuiz('')
-    setQuestions([])
-    setQuizResult(null)
   }
 
   async function loadQuizQuestions(id: string) {
@@ -424,10 +481,12 @@ export default function App() {
 
         {page === 'materiais' && <section className="content">
           <div className="page-title-row"><div><div className="eyebrow">BIBLIOTECA PESSOAL</div><h1>Meus materiais</h1><p className="muted">Selecione vários arquivos de uma vez. O processamento só começa quando você mandar iniciar.</p></div><div className="auth-actions"><button className="secondary-btn" disabled={uploading || processingMaterials} onClick={() => document.getElementById('file-input')?.click()}><Plus size={17}/> {uploading ? 'Enviando...' : 'Adicionar arquivos'}</button>{materials.some(m => m.status === 'uploaded') && <button className="primary-btn" disabled={uploading || processingMaterials} onClick={processUploadedMaterials}><Sparkles size={17}/> {processingMaterials ? 'Processando...' : 'Processar materiais'}</button>}</div></div>
+          {uploading && <div className="progress-panel"><div className="progress-label"><span>Enviando {uploadFileName}</span><strong>{uploadProgress}%</strong></div><div className="progress-track"><div className="progress-fill" style={{width:`${uploadProgress}%`}}/></div></div>}
+          {processingMaterials && <div className="progress-panel"><div className="progress-label"><span>Processando {processingCurrent}</span><strong>{processingProgress}%</strong></div><div className="progress-track"><div className="progress-fill" style={{width:`${processingProgress}%`}}/></div><small className="muted">Extraindo conteúdo e gerando resumo e simulados. Aguarde até concluir.</small></div>}
           <input id="file-input" type="file" multiple accept=".pdf,.doc,.docx,.ppt,.pptx,.txt" hidden onChange={e => { const files=Array.from(e.target.files ?? []); if(files.length) uploadMaterials(files); e.currentTarget.value='' }}/>
           {!user ? <div className="upload-zone"><div className="upload-icon"><CloudUpload size={30}/></div><h3>Entre para enviar materiais</h3><p>O armazenamento é privado e vinculado à sua conta.</p><button className="secondary-btn" onClick={() => setShowAuth(true)}>Entrar ou criar conta</button></div> : <>
             <div className="panel" style={{marginTop:25}}><div className="panel-head"><div><h3>Disciplina do novo material</h3><p className="muted">Opcional. Você pode criar uma disciplina pelo botão +.</p></div><button className="icon-btn" onClick={createSubject}><Plus size={17}/></button></div><select value={selectedSubject} onChange={e => setSelectedSubject(e.target.value)} style={{marginTop:15,width:'100%',padding:11,border:'1px solid #dfe5e2',borderRadius:8}}><option value="">Sem disciplina</option>{subjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select></div>
-            <div className="upload-zone"><div className="upload-icon"><CloudUpload size={30}/></div><h3>Adicione seu próximo material</h3><p>PDF, DOCX, PPTX ou TXT. O arquivo será enviado ao bucket privado <strong>study-materials</strong>.</p><button className="secondary-btn" disabled={uploading} onClick={() => document.getElementById('file-input')?.click()}>{uploading ? 'Enviando...' : 'Selecionar arquivo'}</button><small>Limite inicial: 20 MB por arquivo.</small></div>
+            <div className="upload-zone"><div className="upload-icon"><CloudUpload size={30}/></div><h3>Adicione seus materiais</h3><p>Selecione um ou vários arquivos. Eles serão enviados ao bucket privado <strong>study-materials</strong>.</p><button className="secondary-btn" disabled={uploading || processingMaterials} onClick={() => document.getElementById('file-input')?.click()}>{uploading ? 'Enviando...' : 'Selecionar arquivos'}</button><small>Limite inicial: 20 MB por arquivo.</small></div>
           </>}
           <div className="notice"><Sparkles size={18}/><div><strong>Processamento manual</strong><p>Os arquivos são apenas enviados primeiro. Depois de conferir a lista, clique em "Processar materiais" para extrair o conteúdo, gerar os resumos e criar os simulados.</p></div></div>
           {loadingData ? <p className="muted" style={{marginTop:20}}>Carregando biblioteca...</p> : materials.length > 0 && <div className="panel" style={{marginTop:17}}><div className="panel-head"><div><h3>Arquivos enviados</h3><p className="muted">{materials.length} material(is). {materials.filter(m => m.status === 'uploaded').length} aguardando processamento.</p></div></div><div className="steps">{materials.map(m => <div className="step" key={m.id}><div className="step-icon"><FileText size={17}/></div><div className="step-copy"><strong>{m.title}</strong><small>{m.original_filename} · {m.status === 'uploaded' ? 'aguardando processamento' : m.status === 'processing' ? 'processando...' : m.status === 'ready' ? 'pronto' : m.status}</small></div><span className="level-status">{new Date(m.created_at).toLocaleDateString('pt-BR')}</span><button className="icon-btn" title="Apagar material" disabled={processingMaterials || uploading} onClick={() => deleteMaterial(m)}><Trash2 size={16}/></button></div>)}</div></div>}
