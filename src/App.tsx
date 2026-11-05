@@ -74,13 +74,14 @@ export default function App() {
       supabase.from('quizzes').select('id,title,description,difficulty,level,question_count,material_id,summary_id,study_batch_id,quiz_type').order('created_at', { ascending: false }),
       supabase.from('quiz_attempts').select('id,quiz_id,score,correct_count,total_questions,completed_at').order('completed_at', { ascending: false }),
     ])
+    const visibleQuizzes = (quizData ?? []).filter(q => q.quiz_type !== 'recovery' && q.study_batch_id)
     setSubjects(subjectData ?? [])
     setMaterials(materialData ?? [])
     setSummaries(summaryData ?? [])
     setQuizzes(quizData ?? [])
     setAttempts((attemptData ?? []) as any)
     if (!selectedSummary && summaryData?.[0]) setSelectedSummary(summaryData[0].id)
-    if (!selectedQuiz && quizData?.[0]) setSelectedQuiz(quizData[0].id)
+    if (!visibleQuizzes.some(q => q.id === selectedQuiz)) setSelectedQuiz(visibleQuizzes[0]?.id ?? '')
     if (!selectedSubject && subjectData?.[0]) setSelectedSubject(subjectData[0].id)
     setLoadingData(false)
   }
