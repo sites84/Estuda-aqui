@@ -104,9 +104,13 @@ export default function App() {
     if (!supabase) return setAuthMessage('Supabase não está configurado neste build.')
     if (password.length < 6) return setAuthMessage('A senha precisa ter pelo menos 6 caracteres.')
     setAuthMessage('')
+    const redirectTo = new URL(import.meta.env.BASE_URL || '/', window.location.origin).toString()
     const { data, error } = await supabase.auth.signUp({
       email: email.trim(), password,
-      options: { data: { display_name: displayName.trim() || undefined } }
+      options: {
+        data: { display_name: displayName.trim() || undefined },
+        emailRedirectTo: redirectTo,
+      }
     })
     if (error) return setAuthMessage(friendlyError(error))
     if (data.session) {
