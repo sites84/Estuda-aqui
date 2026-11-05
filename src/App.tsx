@@ -42,7 +42,6 @@ export default function App() {
   const [displayName, setDisplayName] = useState('')
   const [authMessage, setAuthMessage] = useState('')
   const [user, setUser] = useState<User | null>(null)
-  const [authReady, setAuthReady] = useState(false)
   const [materials, setMaterials] = useState<Material[]>([])
   const [subjects, setSubjects] = useState<Subject[]>([])
   const [summaries, setSummaries] = useState<Summary[]>([])
@@ -87,15 +86,13 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!supabase) {
-      setAuthReady(true)
-      return
-    }
+    if (!supabase) return
 
+    const client = supabase
     let active = true
 
     const restoreSession = async () => {
-      const { data, error } = await supabase.auth.getSession()
+      const { data, error } = await client.auth.getSession()
       if (!active) return
       if (error) {
         console.error('Falha ao restaurar sessão:', error)
@@ -104,12 +101,11 @@ export default function App() {
         setUser(data.session?.user ?? null)
         if (data.session?.user) await loadData(data.session.user)
       }
-      setAuthReady(true)
     }
 
     restoreSession()
 
-    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
+    const { data: listener } = client.auth.onAuthStateChange((event, session) => {
       if (!active) return
       setUser(session?.user ?? null)
       if (session?.user) {
