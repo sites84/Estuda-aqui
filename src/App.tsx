@@ -42,6 +42,7 @@ export default function App() {
   const [displayName, setDisplayName] = useState('')
   const [authMessage, setAuthMessage] = useState('')
   const [user, setUser] = useState<User | null>(null)
+  const [authReady, setAuthReady] = useState(false)
   const [materials, setMaterials] = useState<Material[]>([])
   const [subjects, setSubjects] = useState<Subject[]>([])
   const [summaries, setSummaries] = useState<Summary[]>([])
@@ -86,23 +87,59 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!supabase) return
+    if (!supabase) {
+      setAuthReady(true)
+      return
+    }
+
     let active = true
-    supabase.auth.getUser().then(({ data }) => { if (active) setUser(data.user) })
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+
+    const restoreSession = async () => {
+      const { data, error } = await supabase.auth.getSession()
+      if (!active) return
+      if (error) {
+        console.error('Falha ao restaurar sessão:', error)
+        setUser(null)
+      } else {
+        setUser(data.session?.user ?? null)
+        if (data.session?.user) await loadData(data.session.user)
+      }
+      setAuthReady(true)
+    }
+
+    restoreSession()
+
+    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!active) return
       setUser(session?.user ?? null)
-      if (session?.user) loadData(session.user)
-      else { setMaterials([]); setSubjects([]); setSummaries([]); setQuizzes([]); setAttempts([]) }
+      if (session?.user) {
+        if (event !== 'INITIAL_SESSION') {
+          window.setTimeout(() => { if (active) loadData(session.user) }, 0)
+        }
+      } else if (event !== 'SIGNED_OUT') {
+        setMaterials([])
+        setSubjects([])
+        setSummaries([])
+        setQuizzes([])
+        setAttempts([])
+      }
     })
-    return () => { active = false; listener.subscription.unsubscribe() }
+
+    return () => {
+      active = false
+      listener.subscription.unsubscribe()
+    }
   }, [])
 
   async function signIn() {
     if (!supabase) return setAuthMessage('Supabase não está configurado neste build.')
     setAuthMessage('')
-    const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password })
-    setAuthMessage(friendlyError(error) || 'Login realizado.')
-    if (!error) { setShowAuth(false); await loadData() }
+    const { data, error } = await supabase.auth.signInWithPassword({ email: email.trim(), password })
+    if (error) return setAuthMessage(friendlyError(error))
+    setUser(data.user)
+    setShowAuth(false)
+    setAuthMessage('')
+    await loadData(data.user)
   }
 
   async function signUp() {
@@ -156,22 +193,25 @@ export default function App() {
   async function uploadFileWithProgress(file: File, path: string, onProgress: (percent: number) => void) {
     if (!supabase) throw new Error('Supabase não está configurado.')
 
-    const sessionResult = await supabase.auth.getSession()
-    const accessToken = sessionResult.data.session?.access_token
-    if (!accessToken) throw new Error('Sua sessão expirou. Entre novamente.')
+    const { data: sessionData } = await supabase.auth.getSession()
+    const accessToken = sessionData.session?.access_token
+    if (!accessToken) throw new Error('Sua sessão não está ativa. Faça login novamente.')
 
     const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string
     const publishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string
-    const endpoint = `${supabaseUrl}/storage/v1/object/study-materials/${path}`
+    const encodedPath = path.split('/').map(encodeURIComponent).join('/')
+    const endpoint = `${supabaseUrl}/storage/v1/object/study-materials/${encodedPath}`
 
     await new Promise<void>((resolve, reject) => {
       const xhr = new XMLHttpRequest()
-      xhr.open('POST', endpoint)
+      xhr.open('POST', endpoint, true)
+      xhr.timeout = 180000
       xhr.setRequestHeader('Authorization', `Bearer ${accessToken}`)
       xhr.setRequestHeader('apikey', publishableKey)
       xhr.setRequestHeader('x-upsert', 'false')
       xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream')
 
+      xhr.upload.onloadstart = () => onProgress(0)
       xhr.upload.onprogress = event => {
         if (event.lengthComputable) onProgress(Math.min(100, Math.round((event.loaded / event.total) * 100)))
       }
@@ -190,7 +230,8 @@ export default function App() {
         }
       }
 
-      xhr.onerror = () => reject(new Error('Falha de conexão durante o upload.'))
+      xhr.onerror = () => reject(new Error('Falha de conexão com o armazenamento.'))
+      xhr.ontimeout = () => reject(new Error('O upload demorou mais de 3 minutos e foi interrompido.'))
       xhr.onabort = () => reject(new Error('Upload cancelado.'))
       xhr.send(file)
     })
