@@ -18,6 +18,7 @@ if(!items.length)return json({error:"Nenhum material com texto extraído foi env
 const ids=[...new Set(items.map((x:any)=>x.material_id))];
 const mr=await db.from("materials").select("id,user_id,title,subject_id").eq("user_id",au.data.user.id).in("id",ids);if(mr.error||!mr.data||mr.data.length!==ids.length)return json({error:"Um ou mais materiais não pertencem à sua conta."},403);
 const mm=new Map(mr.data.map((m:any)=>[m.id,m])),all:any[]=[];for(const x of items){const m=mm.get(x.material_id);if(m)for(const f of facts(clean(x.text)))all.push({text:f,materialId:m.id,materialTitle:m.title})}
+const skill=["reconhecimento","compreensão","aplicação","análise","integração"];
 const pool=[...new Map(all.map(x=>[x.text.toLowerCase(),x])).values()];if(pool.length<20)return json({error:`Foi extraído pouco conteúdo: ${pool.length} unidades distintas. Verifique se o arquivo possui texto selecionável ou precisa de OCR.`},400);
 const title=mr.data.length===1?mr.data[0].title:`${mr.data.length} materiais — ${mr.data.slice(0,3).map((m:any)=>m.title).join(", ")}${mr.data.length>3?"…":""}`;
 const br=await db.from("study_batches").insert({user_id:au.data.user.id,title,material_ids:ids}).select("id").single();if(br.error||!br.data)return json({error:"Não foi possível criar o conjunto de estudo."},500);
